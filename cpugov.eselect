@@ -1,0 +1,244 @@
+# -*-eselect-*-  vim: ft=eselect
+# Copyright 2016 Gentoo Foundation
+# Distributed under the terms of the GNU GPL version 2 or later
+
+DESCRIPTION="Manage cpu governor and frequency settings"
+MAINTAINER="waltdnes@waltdnes.org"
+VERSION="0.1"
+
+#
+# Important; All callers of cpuscan *MUST* declare
+# local i currgov currfreq maxfreq minfreq sysvalues
+cpuscan() {
+	#
+	# If directory '/sys/devices/system/cpu/cpu0/cpufreq' not found, this
+	# machine does not support cpu speed/governor scaling/setting
+	[[ -d /sys/devices/system/cpu/cpu0/cpufreq ]] || \
+		die -q "This machine does not appear to have the necessary\n\
+hardware and/or software support for frequency scaling."
+	#
+	local frequencies REPLY
+	#
+	# Read current governor
+	read currgov < /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor || \
+		die -q "Unable to read from /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+	#
+	# Read list of all available governors, and convert to an array
+	read < /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors
+	sysvalues=( ${REPLY} )
+	#
+	# Frequencies, and the pseudo-governors "max" and "min", can only be set
+	# if the "userspace" governor is available.  If not, exit the function
+	# without appending "max", "min" or any speeds to the sysvalues array.
+	# First grep for string "userspace" among the list of governors.
+	grep -w "userspace" /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors > /dev/null
+	#
+	# If $? is not zero (i.e. "userspace" not found) exit the function here.
+	[[ $? -eq 0 ]] || return 0
+	#
+	# If execution gets here, the userspace governor is available.
+	#
+	# Read current frequency from CPU0
+	read currfreq < /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+	#
+	# Read list of available frequencies from CPU0
+	read < /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+	#
+	# Append pseudo-governors "max" and "min" and the list of frequencies
+	# to the list of governors.
+	sysvalues+=( max min ${REPLY} )
+	#
+	# Get maximum and minimum frequencies.  First step, make array of
+	# available frequencies from most recent "read" command.
+	frequencies=( ${REPLY} )
+	#
+	# Initialize max and min frequency values
+	maxfreq=${frequencies[0]}
+	minfreq=${frequencies[0]}
+	#
+	# Iterate through frequencies, lowering min and raising max as necessary.
+	for (( i = 1; i < ${#frequencies[@]}; i++ )); do
+		[[ ${frequencies[i]} -lt ${minfreq} ]] && minfreq=${frequencies[i]}
+		[[ ${frequencies[i]} -gt ${maxfreq} ]] && maxfreq=${frequencies[i]}
+	done
+}
+
+describe_list() {
+	 echo "List all available cpu governors and frequencies."
+}
+
+do_list() {
+	local i currgov currfreq maxfreq minfreq sysvalues
+	cpuscan
+
+	write_list_start "Available cpu governor and frequency settings:"
+	for (( i = 0; i < ${#sysvalues[@]}; i++ )); do
+		#
+		# Highlight the current governor.
+		[[ "${sysvalues[i]}" = "${currgov}" ]] \
+		&& sysvalues[i]=$(highlight_marker "${sysvalues[i]}")
+		#
+		# Highlight the current frequency *ONLY IF IN USERSPACE MODE*.
+		# Does not make sense otherwise.
+		[[ "${currgov}" = "userspace" ]] \
+		&& [[ "${sysvalues[i]}" = "${currfreq}" ]] \
+		&& sysvalues[i]=$(highlight_marker "${sysvalues[i]}")
+	done
+	write_numbered_list -m "(none found)" "${sysvalues[@]}"
+}
+
+describe_set() {
+	echo "Set cpu governor or frequency"
+}
+
+describe_set_parameters() {
+	echo "<target>"
+}
+
+describe_set_options() {
+	echo "target : governor/frequency name or number (from \"list\" action).\
+ NOTE: pseudo-governors \"max\" and \"min\" and setting specific\
+ frequencies are supported only if the \"userspace\" governor is\
+ compiled into the kernel or as a module."
+}
+
+do_set() {
+	#
+	# Bail if we don't get *EXACTLY* 1 parameter
+	[[ $# -ne 1 ]] && die -q "'set' requires exactly 1 parameter"
+	#
+	# Declare local variables, and get their values via "cpuscan"
+	local i currgov currfreq maxfreq minfreq sysvalues
+	cpuscan
+	#
+	# Is the parameter a positive number?
+	i="${1}"
+	if is_number "$i"; then
+		#
+		# Is it small enough to be an item number on the left side of
+		# 'list' output?
+		if [[ $i -le ${#sysvalues[@]} ]]; then
+			(( i-- ))
+			#
+			# Is the item pointed to numeric?
+			if is_number "${sysvalues[i]}"; then
+				#
+				# If numeric, assume it's a speed, and try to set it
+				set_speed "${sysvalues[i]}"
+			else
+				#
+				# Parameter was not numeric.  Only makes sense if it's a
+				# governor.  So try to set a governor.
+				set_gov "${sysvalues[i]}"
+			fi
+		else
+			#
+			# It's too large to be a list item.  Therefore, assume that it's an
+			# actual speed that the user wants to set.
+			set_speed ${1}
+		fi
+	else
+		#
+		# Parameter was not numeric; therefore assume that it's the
+		# literal name of a pseudo or real governor, and try to set it.
+		set_gov ${1}
+	fi
+}
+
+set_gov() {
+	#
+	# "sysvalues" declared local in calling function "do_set"
+	local core corecount failflag i
+	#
+	# failflag is set true to start, and false upon succesfull setting
+	# of governor and/or speed.  If failflag is not false at the end of
+	# the following case statement, we have a problem.
+	failflag=0
+	#
+	# First check for special values "max" and "min".  Failing that
+	# assume that it's the literal name of a governor, and try to set
+	# that governor.
+	case ${1} in
+		max)
+			set_speed ${maxfreq}
+			failflag=1
+			;;
+		min)
+			set_speed ${minfreq}
+			failflag=1
+			;;
+		*)
+			#
+			# Count how many cores are set.  Initialize to zero.
+			corecount=0
+			#
+			# Iterate through sysvalues, trying to find a matching
+			# governor string.
+			for (( i = 0; i < ${#sysvalues[@]}; i++ )); do
+				if [[ "${sysvalues[i]}" = "${1}" ]]; then
+					#
+					# If a match is found, set all cores to that governor
+					for core in /sys/devices/system/cpu/cpu[0-9]*/ ; do
+						#
+						# Increment corecount
+						(( corecount++ ))
+						echo "${1}" > ${core}cpufreq/scaling_governor ||
+							die -q "Unable to set governor.  Does user \
+have write permission to /sys/ ?"
+					done
+					#
+					# 1-line summary; how many cores have governor reset
+					echo "${corecount} cores set to ${1}."
+					#
+					# Set failflag false, to indicate success
+					failflag=1
+				fi
+			done
+			#
+			# If failflag is still 0, the governor was not set.
+			# In that case, issue error message.
+			[[ ${failflag} -eq 0 ]] && \
+				die -q "Invalid governor \"${1}\" requested."
+	esac
+}
+
+set_speed() {
+	#
+	# "sysvalues" declared local in calling function "do_set"
+	local core corecount failflag i
+	#
+	# If failflag is not false at the end of the following loop,
+	# we have a problem.
+	failflag=0
+	#
+	# Count how many cores are set.  Initialize to zero.
+	corecount=0
+	#
+	# Iterate through sysvalues, trying to find a matching speed string
+	for (( i = 0; i < ${#sysvalues[@]}; i++ )); do
+		if [[ "${sysvalues[i]}" = "${1}" ]]; then
+			#
+			# If a match is found, set all cores to that speed.  But first,
+			# set governor to "userspace".  Setting speed does not make
+			# sense under any other governor.
+			set_gov "userspace"
+			for core in /sys/devices/system/cpu/cpu[0-9]*/ ; do
+				#
+				# Increment corecount
+				(( corecount++ ))
+				echo "${1}" > ${core}cpufreq/scaling_setspeed || \
+					die -q "Unable to set frequency.  Does user have \
+write permission to /sys/ ?"
+			done
+			#
+			# 1-line summary; how many cores have governor reset
+			echo "${corecount} cores set to ${1} khz."
+			#
+			# Set failflag false, to indicate success
+			failflag=1
+		fi
+	done
+	#
+	# If failflag is still 0, the speed was not set.  Issue error message.
+	[[ ${failflag} -eq 0 ]] && die -q "Invalid frequency \"${1}\" requested."
+}
